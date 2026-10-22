@@ -166,71 +166,112 @@ def _pick(statement, *labels):
     return np.nan
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_one(symbol):
-    """Fetch one REAL Yahoo equity record and its latest annual statements.
+    """Best-effort Yahoo annual data fetch; API failures never imply delisting.
 
-    No placeholder statements and no zero-filling. Invalid, ETF, or unverified symbols
-    are never marked verified. Network failure is reported, not converted to absence.
+    The 15-minute cache permits retrying transient Yahoo blocks. Only explicit
+    EQUITY quote metadata is considered an equity verification.
     """
     import yfinance as yf
     response = {"ticker": symbol, "verification_status": "Not verified",
-                "statement_status": "Unavailable", "statement_error": pd.NA}
+                "statement_status": "Unavailable", "statement_error": pd.NA,
+                "info_asof_utc": datetime.now(timezone.utc).isoformat()}
+    stock = yf.Ticker(symbol)
+    info = {}
+    errors = []
+    # get_info() commonly fails on Streamlit Cloud when Yahoo throttles a request.
+    # Treat that as an API issue, not as a statement that 3M/AbbVie is delisted.
     try:
-        stock = yf.Ticker(symbol)
-        info = stock.get_info()
-        if not info or (info.get("quoteType") or "").upper() != "EQUITY":
-            response["verification_status"] = "Not an equity / not found"
-            return response
-        response.update({"verification_status": "Yahoo equity verified",
-                         "name": info.get("longName") or info.get("shortName") or symbol,
-                         "sector": info.get("sector") or pd.NA,
-                         "exchange": info.get("exchange") or pd.NA,
-                         "quote_type": info.get("quoteType"),
-                         "market_cap": info.get("marketCap"),
-                         "price": info.get("currentPrice") or info.get("regularMarketPrice"),
-                         "trailing_pe": info.get("trailingPE"),
-                         "forward_pe": info.get("forwardPE"),
-                         "price_to_book": info.get("priceToBook"),
-                         "price_to_sales": info.get("priceToSalesTrailing12Months"),
-                         "ev_to_ebitda": info.get("enterpriseToEbitda"),
-                         "info_asof_utc": datetime.now(timezone.utc).isoformat()})
+        info = stock.get_info() or {}
+    except Exception as exc:
+        errors.append(f"Quote lookup: {type(exc).__name__}: {exc}")
+    typ = str(info.get("quoteType") or "").upper()
+    # yfinance returns sparse information for some valid listed companies.
+    # Alternative metadata can verify the equity type without relying on info.
+    if not typ:
         try:
-            bs, inc, cf = stock.balance_sheet, stock.income_stmt, stock.cashflow
-            if bs is None or inc is None or cf is None or bs.empty or inc.empty or cf.empty:
-                response["statement_error"] = "At least one annual statement was empty"
-                return response
-            dates = [pd.to_datetime(x.columns[0]).date() for x in (bs, inc, cf)]
-            # Do not blend unrelated fiscal years silently.
-            if max(dates) - min(dates) > pd.Timedelta(days=100):
-                response["statement_error"] = "Annual statements are from mismatched fiscal periods"
-                return response
-            response["statement_asof"] = str(min(dates))
-            response.update({
-                "net_income": _pick(inc, "Net Income", "Net Income Common Stockholders"),
-                "operating_cash_flow": _pick(cf, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities"),
-                "total_assets": _pick(bs, "Total Assets"),
-                "total_liabilities": _pick(bs, "Total Liabilities Net Minority Interest", "Total Liabilities"),
-                "total_equity": _pick(bs, "Stockholders Equity", "Total Equity Gross Minority Interest"),
-                "current_assets": _pick(bs, "Current Assets"),
-                "current_liabilities": _pick(bs, "Current Liabilities"),
-                "gross_profit": _pick(inc, "Gross Profit"),
-                "total_revenue": _pick(inc, "Total Revenue", "Operating Revenue"),
-                "ebit": _pick(inc, "EBIT", "Operating Income"),
-                "retained_earnings": _pick(bs, "Retained Earnings"),
-                "working_capital": _pick(bs, "Working Capital"),
-                "total_debt": _pick(bs, "Total Debt")})
-            if pd.isna(response["working_capital"]):
-                x, y = response["current_assets"], response["current_liabilities"]
-                if pd.notna(x) and pd.notna(y):
-                    response["working_capital"] = x - y
-            response["statement_status"] = ("Annual statements retrieved" if
-                pd.notna(response["total_assets"]) and pd.notna(response["net_income"]) and
-                pd.notna(response["operating_cash_flow"]) else "Partial annual statements")
-        except Exception as e:
-            response["statement_error"] = f"Annual statements not retrievable: {type(e).__name__}: {e}"[:250]
-    except Exception as e:
-        response["statement_error"] = f"Yahoo lookup failed: {type(e).__name__}: {e}"[:250]
+            metadata = stock.get_history_metadata() or {}
+            typ = str(metadata.get("instrumentType") or metadata.get("quoteType") or "").upper()
+        except Exception as exc:
+            errors.append(f"History metadata: {type(exc).__name__}: {exc}")
+    if typ == "EQUITY":
+        response["verification_status"] = "Yahoo equity verified"
+    elif typ and typ not in {"UNKNOWN", "NONE"}:
+        response["verification_status"] = f"Reported non-equity type: {typ}"
+        response["statement_error"] = "; ".join(errors)[:350] if errors else pd.NA
+        return response
+    # Empty metadata is NOT evidence of a fake ticker; try annual statements.
+    response.update({"name": info.get("longName") or info.get("shortName") or symbol,
+                     "sector": info.get("sector") or pd.NA,
+                     "exchange": info.get("exchange") or pd.NA,
+                     "quote_type": typ or pd.NA,
+                     "market_cap": info.get("marketCap"),
+                     "price": info.get("currentPrice") if info.get("currentPrice") is not None else info.get("regularMarketPrice"),
+                     "trailing_pe": info.get("trailingPE"),
+                     "forward_pe": info.get("forwardPE"),
+                     "price_to_book": info.get("priceToBook"),
+                     "price_to_sales": info.get("priceToSalesTrailing12Months"),
+                     "ev_to_ebitda": info.get("enterpriseToEbitda")})
+    if not info:
+        try:
+            fi = stock.fast_info
+            price = fi.get("last_price")
+            mcap = fi.get("market_cap")
+            if price is not None:
+                response["price"] = price
+            if mcap is not None:
+                response["market_cap"] = mcap
+        except Exception as exc:
+            errors.append(f"Fast quote: {type(exc).__name__}: {exc}")
+
+    try:
+        bs, inc, cf = stock.balance_sheet, stock.income_stmt, stock.cashflow
+        if any(x is None or x.empty for x in (bs, inc, cf)):
+            errors.append("One or more Yahoo annual statements are empty")
+        else:
+            # Find the latest matching annual period instead of mixing fiscal years.
+            date_cols = []
+            for statement in (bs, inc, cf):
+                date_cols.append({pd.Timestamp(col).normalize(): col for col in statement.columns})
+            common = set(date_cols[0]) & set(date_cols[1]) & set(date_cols[2])
+            if not common:
+                errors.append("No shared fiscal year across the three statements")
+            else:
+                asof = max(common)
+                bs, inc, cf = (frame[[columns[asof]]] for frame, columns in
+                               zip((bs, inc, cf), date_cols))
+                response["statement_asof"] = str(asof.date())
+                response.update({
+                    "net_income": _pick(inc, "Net Income", "Net Income Common Stockholders"),
+                    "operating_cash_flow": _pick(cf, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities"),
+                    "total_assets": _pick(bs, "Total Assets"),
+                    "total_liabilities": _pick(bs, "Total Liabilities Net Minority Interest", "Total Liabilities"),
+                    "total_equity": _pick(bs, "Stockholders Equity", "Total Equity Gross Minority Interest"),
+                    "current_assets": _pick(bs, "Current Assets"),
+                    "current_liabilities": _pick(bs, "Current Liabilities"),
+                    "gross_profit": _pick(inc, "Gross Profit"),
+                    "total_revenue": _pick(inc, "Total Revenue", "Operating Revenue"),
+                    "ebit": _pick(inc, "EBIT", "Operating Income"),
+                    "retained_earnings": _pick(bs, "Retained Earnings"),
+                    "working_capital": _pick(bs, "Working Capital"),
+                    "total_debt": _pick(bs, "Total Debt")})
+                if pd.isna(response["working_capital"]):
+                    x, y = response["current_assets"], response["current_liabilities"]
+                    if pd.notna(x) and pd.notna(y):
+                        response["working_capital"] = x - y
+                response["statement_status"] = (
+                    "Annual statements retrieved"
+                    if all(pd.notna(response[k]) for k in ("total_assets", "net_income", "operating_cash_flow"))
+                    else "Partial annual statements")
+                if typ != "EQUITY":
+                    response["verification_status"] = "Statements found; equity type unconfirmed"
+    except Exception as exc:
+        errors.append(f"Annual statements: {type(exc).__name__}: {exc}")
+    if errors:
+        response["statement_error"] = "; ".join(errors)[:500]
+        if response["verification_status"] == "Not verified":
+            response["verification_status"] = "Yahoo lookup unavailable / inconclusive"
     return response
 
 
@@ -240,11 +281,12 @@ def merge_fetch(base, rows):
         symbol = r["ticker"]
         if symbol not in d.index:
             continue
-        if r.get("verification_status") != "Yahoo equity verified":
-            for k in ("verification_status", "statement_status", "statement_error"):
-                if pd.notna(r.get(k, pd.NA)):
-                    d.at[symbol, k] = r[k]
-            continue
+        # Preserve previously verified status on transient failures, and never
+        # discard usable financial fields merely because quote type is absent.
+        previous = d.at[symbol, "verification_status"]
+        if (previous == "Yahoo equity verified" and
+                r.get("verification_status") != "Yahoo equity verified"):
+            r = {**r, "verification_status": previous}
         for k, value in r.items():
             if k == "ticker" or pd.isna(value):
                 continue
@@ -261,6 +303,63 @@ def pretty(x, percent=False, money=False):
         return f"${x/1e9:,.2f}B"
     return f"{x*100:+.2f}%" if percent else f"{x:,.2f}"
 
+
+
+
+def display_table(rows, columns, names, percent_columns=(), decimals=2):
+    """Readable formatting only: the underlying screen retains full precision."""
+    view = rows.loc[:, columns].copy().rename(columns=names)
+    for original in percent_columns:
+        label = names.get(original, original)
+        if label in view:
+            view[label] = pd.to_numeric(view[label], errors="coerce") * 100
+    numeric = view.select_dtypes(include="number").columns
+    for label in numeric:
+        if label not in ("Red flags", "Signals observed", "STA peers", "GPA peers", "B/M peers"):
+            view[label] = view[label].round(decimals)
+    st.dataframe(view, hide_index=True, use_container_width=True)
+
+
+def explain_company(row):
+    """Draw conclusions only from observable evidence; distinguish clues and claims."""
+    reasons = []
+    if pd.notna(row["sta_demeaned"]):
+        reasons.append(f"STA is {row['sta'] * 100:.2f}% versus an estimated sector mean of "
+                       f"{(row['sta'] - row['sta_demeaned']) * 100:.2f}% "
+                       f"({row['sta_peers']:.0f} usable sector observations).")
+    for field, label in [("trailing_pe_premium_pct", "P/E"), ("price_to_book_premium_pct", "P/B")]:
+        if pd.notna(row[field]):
+            reasons.append(f"{label} trades {row[field]:+.1f}% versus its positive-multiple sector median.")
+    if pd.notna(row["altman_z"]):
+        reasons.append(f"Original Altman Z is {row['altman_z']:.2f}; it indicates distress exposure, not overvaluation.")
+    if pd.notna(row["net_income"]) and pd.notna(row["operating_cash_flow"]):
+        reasons.append(f"Annual net income is {pretty(row['net_income'], money=True)} and operating cash flow "
+                       f"is {pretty(row['operating_cash_flow'], money=True)}.")
+    if row["sell_candidate"]:
+        headline = f"**Potential SELL research candidate — {int(row['sell_flags'])} selected red flags.** "
+        conclusion = ("The combination of observed signals warrants further scrutiny of earnings quality, "
+                      "valuation and/or financial strength. It is not proof the shares are overpriced. ")
+        counter = "Counterargument: growth prospects, one-off accounting items, and industry differences may justify some signals."
+    elif row["buy_candidate"]:
+        headline = "**Potential BUY research candidate — independent quality/value screen.** "
+        conclusion = (f"Gross profitability is {row['gpa']*100:.2f}% of assets "
+                      f"({row['gpa_demeaned']*100:+.2f} percentage points relative to sector mean), "
+                      f"while book-to-market is {row['book_to_market']:.2f} "
+                      f"({row['book_to_market_demeaned']:+.2f} relative to sector mean). "
+                      "Both are observable above the selected benchmarks. ")
+        counter = "Counterargument: apparent value can reflect deteriorating fundamentals or accounting differences."
+    elif row["valuation_watch"]:
+        headline = "**Preliminary valuation watch — NOT a confirmed SELL.** "
+        conclusion = "Peer multiples look elevated, but available accounting evidence is not sufficient for a short thesis. "
+        counter = "Counterargument: superior expected growth or profitability may warrant a valuation premium."
+    else:
+        headline = "**No supported BUY/SELL classification under current filters.** "
+        conclusion = "This is not a recommendation to hold: the evidence is mixed, unavailable, or outside the selected thresholds. "
+        counter = "Revisit the choice of sector peers and data coverage before drawing an investment conclusion."
+    text = headline + conclusion + " ".join(reasons) + " " + counter
+    if pd.notna(row["statement_asof"]):
+        text += f" Annual financial statements are dated {row['statement_asof']}; market prices may be from a different date."
+    return text
 
 st.markdown("""<style>.block-container{padding-top:1.6rem;max-width:1520px}
 [data-testid='stMetric']{border:1px solid rgba(120,120,120,.18);padding:12px;border-radius:10px}
@@ -285,7 +384,7 @@ with st.sidebar:
             base = normalize(pd.read_csv(BytesIO(incoming.getvalue())))
         except Exception as exc:
             st.error(f"Invalid uploaded CSV: {exc}")
-    st.caption("Saved rows are a historical universe, not proof of a current listing. Fetching validates each ticker using Yahoo's EQUITY quote type.")
+    st.caption("Saved rows are historical. Explicit Yahoo EQUITY metadata confirms a listing; API failures and missing quote types remain unverified, never automatically invalid.")
     available = base["ticker"].tolist()
     chosen = st.multiselect("Tickers for Yahoo statement verification", available,
                             default=available[:min(10, len(available))], max_selections=75)
@@ -297,7 +396,10 @@ with st.sidebar:
             for i, symbol in enumerate(chosen, 1):
                 st.session_state.enriched[symbol] = fetch_one(symbol)
                 bar.progress(i / len(chosen), text=f"Retrieved {i} of {len(chosen)}")
-            st.success("Fetch finished. See per-ticker statuses; Yahoo failures are not counted as verified.")
+            st.success("Requests completed. Check the audit results; attempts are not proof of successful retrieval.")
+    if st.button("Retry failed Yahoo lookups", use_container_width=True):
+        fetch_one.clear()
+        st.info("Yahoo cache cleared. Select the tickers and press Verify again.")
     if st.button("Clear this session's fetched records"):
         st.session_state.enriched = {}
         st.rerun()
@@ -376,12 +478,23 @@ with sell_tab:
             "trailing_pe_premium_pct", "price_to_book_premium_pct", "altman_z", "operating_cash_flow",
             "net_income", "sell_explanation", "verification_status"]
     sells = result[result["sell_candidate"]].sort_values(["sell_flags", "sta_demeaned"], ascending=False)
-    st.dataframe(sells[cols], hide_index=True, use_container_width=True)
+    display_table(sells, ["ticker", "name", "sector", "sell_flags", "sell_coverage",
+        "sta", "sta_demeaned", "sta_peers", "trailing_pe_premium_pct",
+        "price_to_book_premium_pct", "altman_z", "sell_explanation"],
+        {"ticker": "Ticker", "name": "Company", "sector": "Sector", "sell_flags": "Red flags",
+         "sell_coverage": "Signals observed", "sta": "STA (%)", "sta_demeaned": "Adjusted STA (pp)",
+         "sta_peers": "STA peers", "trailing_pe_premium_pct": "P/E premium (%)",
+         "price_to_book_premium_pct": "P/B premium (%)", "altman_z": "Altman Z",
+         "sell_explanation": "Evidence"}, percent_columns=["sta", "sta_demeaned"])
+    if len(sells) and (sells["sta_peers"].fillna(0) < 10).any():
+        st.warning("Some flagged firms have fewer than 10 usable sector STA peers. Interpret sector averages cautiously.")
     st.subheader("Preliminary valuation watchlist · NOT accounting-confirmed shorts")
     watch = result[result["valuation_watch"]].sort_values("trailing_pe_premium_pct", ascending=False)
-    st.dataframe(watch[["ticker", "name", "sector", "trailing_pe_premium_pct",
-                       "price_to_book_premium_pct", "sta", "statement_status"]],
-                 hide_index=True, use_container_width=True)
+    display_table(watch, ["ticker", "name", "sector", "trailing_pe_premium_pct",
+        "price_to_book_premium_pct", "sta", "statement_status"],
+        {"ticker": "Ticker", "name": "Company", "sector": "Sector",
+         "trailing_pe_premium_pct": "P/E premium (%)", "price_to_book_premium_pct": "P/B premium (%)",
+         "sta": "STA (%)", "statement_status": "Statement status"}, percent_columns=["sta"])
     st.download_button("Download SELL and watchlist observations", result.to_csv(index=False).encode(),
                        "acct3343_short_screen.csv", "text/csv")
 
@@ -389,9 +502,15 @@ with buy_tab:
     st.subheader("Independent BUY methodology · profitability + balance-sheet value")
     st.caption("BUY is NOT low STA or high Altman Z. It independently requires above-benchmark gross profitability and book-to-market.")
     buys = result[result["buy_candidate"]].sort_values("buy_rank", ascending=False)
-    st.dataframe(buys[["ticker", "name", "sector", "gpa", "gpa_demeaned", "book_to_market",
-                       "book_to_market_demeaned", "buy_rank", "statement_asof", "verification_status"]],
-                 hide_index=True, use_container_width=True)
+    display_table(buys, ["ticker", "name", "sector", "gpa", "gpa_demeaned", "gpa_peers",
+        "book_to_market", "book_to_market_demeaned", "book_to_market_peers", "buy_rank", "statement_asof"],
+        {"ticker": "Ticker", "name": "Company", "sector": "Sector", "gpa": "Gross profit/assets (%)",
+         "gpa_demeaned": "GPA above sector (pp)", "gpa_peers": "GPA peers",
+         "book_to_market": "Book-to-market", "book_to_market_demeaned": "B/M minus sector mean",
+         "book_to_market_peers": "B/M peers", "buy_rank": "Rank (0–1)", "statement_asof": "Fiscal year end"},
+        percent_columns=["gpa", "gpa_demeaned"])
+    if len(buys) and ((buys["gpa_peers"].fillna(0) < 10) | (buys["book_to_market_peers"].fillna(0) < 10)).any():
+        st.warning("Some BUY candidates have fewer than 10 usable sector observations. Sector-relative results are provisional.")
 
 with exploration_tab:
     x1,x2 = st.columns(2)
@@ -424,20 +543,11 @@ with exploration_tab:
         d2.metric("Industry-adjusted STA", pretty(r["sta_demeaned"], percent=True))
         d3.metric("Gross profitability", pretty(r["gpa"], percent=True))
         d4.metric("Book-to-market", pretty(r["book_to_market"]))
-        if r["sell_candidate"]:
-            st.error(f"**Potential SELL research conclusion:** {r['sell_explanation']}. "
-                     "Investigate whether weak earnings quality or distress is temporary, and check the firm's growth outlook before considering a short.")
-        elif r["buy_candidate"]:
-            st.success("**Potential BUY research conclusion:** above-sector gross profit on assets and "
-                       "above-sector book-to-market jointly suggest a quality/value combination. "
-                       "Investigate competitive durability, debt, and whether reported profits translate to cash.")
-        elif r["valuation_watch"]:
-            st.warning("**Preliminary watch conclusion:** peer-relative valuation is elevated, but "
-                       "there is not enough accounting confirmation for a SELL classification. "
-                       "A strong growth outlook can justify high multiples.")
-        else:
-            st.info("**No supported BUY or SELL call under current rules.** Missing data or weak/mixed "
-                    "evidence should not be mistaken for a neutral fundamental assessment.")
+        st.markdown(explain_company(r))
+        if pd.notna(r["sta_demeaned"]):
+            st.caption(f"STA sector benchmark: {(r['sta'] - r['sta_demeaned'])*100:.2f}% "
+                       f"using {int(r['sta_peers'])} observations. "
+                       "Comparisons change when universe filters change.")
         st.write("**Evidence:**", r["sell_explanation"])
         st.write(f"Reported net income: {pretty(r['net_income'], money=True)} · "
                  f"Operating cash flow: {pretty(r['operating_cash_flow'], money=True)} · "
@@ -455,6 +565,13 @@ with exploration_tab:
 
 with methodology_tab:
     st.markdown("""
+    ### How to interpret this app
+    **Potential SELL** combines observed earnings-quality, relative-valuation, cash-conversion and/or
+    distress-warning signals. **Potential BUY** is an independent profitability-plus-book-value
+    screen; it is not the reverse of SELL. These are research candidates, not verified mispricings.
+    Peer benchmarks reflect the currently filtered, available-data population, not all 903 tickers.
+    Sector averages can be unstable when statement coverage is thin or accruals contain outliers.
+
     ### Course formulas and interpretations
     **SELL — four distinct warning signs:**
     1. **Scaled total accruals (STA)** = `(annual net income − annual operating cash flow) / annual total assets`. Higher positive STA may mean profits are not supported by cash. **Sector demeaning** = company STA minus the arithmetic mean STA among companies in its sector with usable annual statements; this helps compare earnings quality against the group rather than across unrelated industries. Sector means need the minimum number of valid peers.
@@ -479,6 +596,7 @@ with quality_tab:
     counts["missing"] = len(result) - counts["populated"]
     st.subheader("Completeness and provenance of the currently filtered universe")
     st.dataframe(counts, hide_index=True, use_container_width=True)
+    st.caption("If lookups say unavailable/inconclusive, Yahoo may be blocking cloud requests. Review statement_error, retry after a short delay, or upload a CSV exported from a successful local/Colab run.")
     st.caption(f"Rows: {len(result)} · unique tickers: {result['ticker'].nunique()} · "
                f"verified in full loaded dataset: {combined['verification_status'].eq('Yahoo equity verified').sum()} · "
                f"statement rows: {combined['statement_status'].eq('Annual statements retrieved').sum()}")
